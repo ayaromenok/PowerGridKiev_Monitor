@@ -26,23 +26,23 @@ import requests
 API_BASE = "https://app.yasno.ua/api/blackout-service/public/shutdowns"
 
 REGION_NAME = "Київ"
-STREET_QUERY = "вул. Драгоманова"
+STREET_QUERY = "ул. Драгоманова"
 HOUSE_QUERY = "3А"
 
-DAY_NAMES = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Нд"]
+DAY_NAMES = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 
 TYPE_MARKS = {"Definite": "##", "Possible": "..", "NotPlanned": "..", "Unknown": ".."}
 
 # Home Assistant MQTT auto-discovery / state topics
 HA_DISCOVERY_PREFIX = "homeassistant"  # homeassistant/<component>/<object_id>/config
-STATE_PREFIX = "yasnoutages"           # yasnoutages/<object_id>/state|attrs
+STATE_PREFIX = "powergrid"           # yasnoutages/<object_id>/state|attrs
 
 
 def now_local_minutes() -> int:
     from datetime import datetime
     from zoneinfo import ZoneInfo
 
-    dt = datetime.now(ZoneInfo("Europe/Kyiv"))
+    dt = datetime.now(ZoneInfo("Europe/Kiev"))
     return dt.hour * 60 + dt.minute
 
 
@@ -173,7 +173,7 @@ def render_table(group: str, entry: dict) -> str:
     status = entry.get("status", "")
 
     lines = [
-        "## YASNO — Kyiv outages",
+        "## Kiev Power Grid outages",
         "",
         f"| Address | Group | Date | Status |",
         f"|---------|-------|------|--------|",
@@ -225,7 +225,7 @@ def render_table(group: str, entry: dict) -> str:
 # ---------------------------------------------------------------------------
 
 def _object_id(name: str) -> str:
-    return "yasnoutages_" + name.replace(" ", "_").replace("/", "_").lower()
+    return "powergrid_" + name.replace(" ", "_").replace("/", "_").lower()
 
 
 def _device_info(state: OutageState) -> dict:
