@@ -3,7 +3,7 @@
 A small Python app that reproduces the flow of
 <https://static.yasno.ua/kyiv/outages> without a browser:
 
-1. Looks up the street in the **Вулиця** field → `вул. Драгоманова`
+1. Looks up the street in the **Вулиця** field → `ул. Драгоманова`
 2. Looks up the house in the **Буд** field → `3А`
 3. Resolves the house's outage group (e.g. `45.1`)
 4. Fetches the planned-outages schedule and prints the resulting
@@ -14,7 +14,7 @@ The website is a React SPA; all data comes from the public
 
 | Step | Endpoint |
 |------|----------|
-| Region (Київ → id 25, DSO id 902) | `/api/blackout-service/public/shutdowns/addresses/v2/regions` |
+| Region (Киев → id 25, DSO id 902) | `/api/blackout-service/public/shutdowns/addresses/v2/regions` |
 | Street search (`query=`) | `.../addresses/v2/streets?regionId&dsoId&query` |
 | House search (`query=`) | `.../addresses/v2/houses?regionId&streetId&dsoId&query` |
 | House → group | `.../addresses/v2/group?regionId&streetId&houseId&dsoId` |
@@ -50,7 +50,7 @@ Discovery topics: `homeassistant/binary_sensor/yasnoutages_power_45.1/config`,
 picks the entities up automatically. Both entities carry JSON attributes
 (address, group, schedule date/status, current slot, next outage start/end).
 
-The power state is evaluated against the current time in `Europe/Kyiv`
+The power state is evaluated against the current time in `Europe/Kiev`
 against the selected day's slots (`Definite`/`Possible` ⇒ OFF).
 
 To update Home Assistant regularly, e.g. every 5 minutes:
@@ -71,7 +71,7 @@ Output looks like:
   00-+-01-+-02-+-03-+-...+-23
   ----+-----+-----+-----+
   ..-+-..-+-..-+-##-+-...
-  04:30 - 08:00  Відключення (definite)
+  04:30 - 08:00  Grid Off (definite)
   ...
   Legend: ## = definite outage, .. = power available / possible outage
 ```
