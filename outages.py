@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -28,6 +30,10 @@ API_BASE = "https://app.yasno.ua/api/blackout-service/public/shutdowns"
 REGION_NAME = "Київ"
 STREET_QUERY = "ул. Драгоманова"
 HOUSE_QUERY = "3А"
+
+# Default polling interval for re-checking the power grid status and
+# refreshing the MQTT state topics: 3 hours.
+DEFAULT_POLL_INTERVAL_HOURS = 3.0
 
 DAY_NAMES = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 
@@ -322,18 +328,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--house", default=HOUSE_QUERY, help=f"house query (default {HOUSE_QUERY!r})")
     parser.add_argument("--day", choices=["today", "tomorrow"], default="today",
                         help="which day of the schedule to show (default today)")
+    parser.add_argument("--poll-interval", default=None,
+                        help="interval between status checks (e.g. '3', '3h', '90m'; "
+                             f"default {DEFAULT_POLL_INTERVAL_HOURS:g} hours). "
+                             "Use '0' or 'once' for a single check.")
+    parser.add_argument("--once", action="store_true",
+                        help="run a single check and exit (same as --poll-interval 0)")
     return parser.parse_args(argv)
 
 
-def main() -> None:
-    args = parse_args()
-
-    global STREET_QUERY, HOUSE_QUERY
-    STREET_QUERY = args.street
-    HOUSE_QUERY = args.house
-
-    client = Client(requests.Session())
-
+def run_once(client: Client, args: argparse.Namespace, iteration: int = 1) -> None:
+    """One check: look up the group, print the table, and (if MQTT is
+    configured) refresh the Home Assistant state topics."""
     print(f"Searching street: {STREET_QUERY!r}")
     region = find_region(client, REGION_NAME)
     street = find_street(client, region, STREET_QUERY)
@@ -359,6 +365,50 @@ def main() -> None:
                                   args.mqtt_user, args.mqtt_pass)
 
 
+def parse_interval(value: str) -> float:
+    """Parse a duration like '3', '3h', '90m', '2.5h' into hours."""
+    v = value.strip().lower()
+    if v.endswith("h"):
+        return float(v[:-1])
+    if v.endswith("m"):
+        return float(v[:-1]) / 60.0
+    # Bare number = hours
+    return float(v)
+
+
+def main() -> None:
+    args = parse_args()
+
+    global STREET_QUERY, HOUSE_QUERY
+    STREET_QUERY = args.street
+    HOUSE_QUERY = args.house
+
+    poll_hours = (
+        parse_interval(args.poll_interval)
+        if args.poll_interval not in (None, "once")
+        else (0.0 if args.once else DEFAULT_POLL_INTERVAL_HOURS)
+    )
+    if poll_hours < 0:
+        raise SystemExit("--poll-interval must be zero or positive")
+
+    client = Client(requests.Session())
+
+    iteration = 0
+    while True:
+        iteration += 1
+        print(f"\n=== Power grid status check #{iteration} "
+              f"(interval: {poll_hours:g}h) ===")
+        run_once(client, args, iteration)
+
+        if poll_hours <= 0:
+            break
+
+        print(f"[poll] sleeping {poll_hours:g}h before next check "
+              f"({time.strftime('%H:%M:%S')} -> "
+              f"{time.strftime('%H:%M:%S', time.localtime(time.time() + poll_hours * 3600))})")
+        time.sleep(poll_hours * 3600)
+
+
 if __name__ == "__main__":
     try:
         main()
@@ -366,3 +416,5 @@ if __name__ == "__main__":
         raise SystemExit(f"Request error: {exc}") from exc
     except OSError as exc:
         raise SystemExit(f"MQTT error: {exc}") from exc
+    except KeyboardInterrupt:
+        raise SystemExit("\nInterrupted") from None

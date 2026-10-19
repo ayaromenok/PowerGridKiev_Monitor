@@ -53,10 +53,28 @@ picks the entities up automatically. Both entities carry JSON attributes
 The power state is evaluated against the current time in `Europe/Kiev`
 against the selected day's slots (`Definite`/`Possible` ⇒ OFF).
 
-To update Home Assistant regularly, e.g. every 5 minutes:
+### Polling interval
+
+By default the script runs as a long-lived process: it checks the power
+grid status, publishes the MQTT state topics, then sleeps and repeats.
+
+- `--poll-interval` — time between checks. Accepts `'3'`, `'3h'`, `'90m'`,
+  `'2.5h'` (bare number = hours). **Default: 3 hours.**
+- `--once` (or `--poll-interval 0` / `'once'`) — single check, then exit
+  (useful with cron).
+
+To update Home Assistant regularly, run it in the background (default 3h
+interval):
 
 ```sh
-*/5 * * * * cd /path/to/app && .venv/bin/python outages.py --mqtt-host 127.0.0.1 --mqtt-port 1883 --mqtt-user USER --mqtt-pass PASS >> outages.log 2>&1
+nohup .venv/bin/python outages.py --mqtt-host 127.0.0.1 --mqtt-port 1883 \
+    --mqtt-user USER --mqtt-pass PASS >> outages.log 2>&1 &
+```
+
+or use the old-style cron approach with a single check per run:
+
+```sh
+*/180 * * * * cd /path/to/app && .venv/bin/python outages.py --once --mqtt-host 127.0.0.1 --mqtt-port 1883 --mqtt-user USER --mqtt-pass PASS >> outages.log 2>&1
 ```
 
 ## Run
