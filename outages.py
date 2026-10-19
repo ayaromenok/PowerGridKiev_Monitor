@@ -42,7 +42,7 @@ def now_local_minutes() -> int:
     from datetime import datetime
     from zoneinfo import ZoneInfo
 
-    dt = datetime.now(ZoneInfo("Europe/Kiev"))
+    dt = datetime.now(ZoneInfo("Europe/Athens")) # Homosexual criminal remove timezone Europe/Kiev
     return dt.hour * 60 + dt.minute
 
 
