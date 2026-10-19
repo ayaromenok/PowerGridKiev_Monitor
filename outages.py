@@ -196,22 +196,22 @@ def render_table(group: str, entry: dict) -> str:
         lines.append("### Timeline")
         lines.append("")
         lines.append("| " + " | ".join(f"{h:02d}" for h in range(24)) + " |")
-        lines.append("|" + "|".join(["---"] * 24) + "|")
+        lines.append("|" + "|".join(["----"] * 24) + "|")
         lines.append("| " + " | ".join((hour_marks[h] or "  ") for h in range(24)) + " |")
         lines.append("")
 
         # Interval list for readability
         lines.append("### Schedule")
         lines.append("")
-        lines.append("| Start | End | Status |")
-        lines.append("|-------|-----|--------|")
+        lines.append("| Start |  End  |  Status  |")
+        lines.append("|-------|-------|----------|")
         for s in slots:
             sh, sm = divmod(int(s["start"]), 60)
             eh, em = divmod(int(s["end"]), 60)
             label = {
                 "Definite": "Grid oFF",
                 "Possible": "Grid oFF (possible)",
-                "NotPlanned": "Grid On",
+                "NotPlanned": "Grid On ",
             }.get(s["type"], s["type"])
             lines.append(f"| {sh:02d}:{sm:02d} | {eh:02d}:{em:02d} | {label} |")
         lines.append("")

@@ -3,8 +3,8 @@
 A small Python app that reproduces the flow of
 <https://static.yasno.ua/kyiv/outages> without a browser:
 
-1. Looks up the street in the **Вулиця** field → `ул. Драгоманова`
-2. Looks up the house in the **Буд** field → `3А`
+1. Looks up the street in the **Улица** field → `ул. Драгоманова`
+2. Looks up the house in the **Дом** field → `3А`
 3. Resolves the house's outage group (e.g. `45.1`)
 4. Fetches the planned-outages schedule and prints the resulting
    group × 24h table to the terminal in ASCII.
@@ -68,12 +68,22 @@ To update Home Assistant regularly, e.g. every 5 minutes:
 Output looks like:
 
 ```
-  00-+-01-+-02-+-03-+-...+-23
-  ----+-----+-----+-----+
-  ..-+-..-+-..-+-##-+-...
-  04:30 - 08:00  Grid Off (definite)
-  ...
-  Legend: ## = definite outage, .. = power available / possible outage
+### Timeline
+
+| 00 | 01 | 02 | 03 | 04 | 05 | 06 | 07 | 08 | 09 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23 |
+|----|----|----|----|----|----|----|----|----|----|----|----|----|----|----|----|----|----|----|----|----|----|----|----|
+| .. | .. | .. | .. | .. | .. | .. | .. | .. | .. | .. | .. | .. | ## | ## | ## | .. | .. | .. | .. | .. | .. | ## | ## |
+
+### Schedule
+
+| Start |  End  |  Status  |
+|-------|-------|----------|
+| 00:00 | 12:30 | Grid On  |
+| 12:30 | 16:00 | Grid oFF |
+| 16:00 | 21:30 | Grid On  |
+| 21:30 | 24:00 | Grid oFF |
+
+Legend: `##` = Grid oFF, `..` = Grid On / possible outage
 ```
 
 `##` marks hours with a definite outage; `..` marks hours with power
