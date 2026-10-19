@@ -167,13 +167,22 @@ def fetch_schedule(client: Client, region: dict, group: str, day: str) -> dict:
 
 
 def render_table(group: str, entry: dict) -> str:
-    """Render the group's 24h slot schedule as an ASCII table."""
+    """Render the group's 24h slot schedule as a Markdown table."""
     slots = entry.get("slots") or []
     date = entry.get("date", "")
     status = entry.get("status", "")
 
+    lines = [
+        "## YASNO — Kyiv outages",
+        "",
+        f"| Address | Group | Date | Status |",
+        f"|---------|-------|------|--------|",
+        f"| {STREET_QUERY}, буд. {HOUSE_QUERY} | {group} | {date} | {status} |",
+        "",
+    ]
+
     if not slots:
-        body = f"  (no schedule for group {group}: status={status})"
+        lines.append(f"No schedule for group {group}: status={status}")
     else:
         # Build a 24-column timeline, one cell per hour.
         hour_marks = [None] * 24
@@ -184,41 +193,31 @@ def render_table(group: str, entry: dict) -> str:
             for h in range(start_h, min(end_h + (1 if end_m else 0), 24)):
                 hour_marks[h] = mark if hour_marks[h] is None else hour_marks[h]
 
-        rows = []
-        header = "  " + "-+-".join(f"{h:02d}" for h in range(24))
-        rows.append(header)
-        rows.append("  " + "-+-".join("---" for _ in range(24)))
-        mark_row = "  " + "-+-".join((hour_marks[h] or "  ") for h in range(24))
-        rows.append(mark_row)
-        rows.append("  " + "-+-".join("---" for _ in range(24)))
+        lines.append("### Timeline")
+        lines.append("")
+        lines.append("| " + " | ".join(f"{h:02d}" for h in range(24)) + " |")
+        lines.append("|" + "|".join(["---"] * 24) + "|")
+        lines.append("| " + " | ".join((hour_marks[h] or "  ") for h in range(24)) + " |")
+        lines.append("")
 
         # Interval list for readability
-        rows.append("")
+        lines.append("### Schedule")
+        lines.append("")
+        lines.append("| Start | End | Status |")
+        lines.append("|-------|-----|--------|")
         for s in slots:
             sh, sm = divmod(int(s["start"]), 60)
             eh, em = divmod(int(s["end"]), 60)
             label = {
-                "Definite": "Відключення (definite)",
-                "Possible": "Можливе відключення (possible)",
-                "NotPlanned": "Постачання (not planned)",
+                "Definite": "Grid oFF",
+                "Possible": "Grid oFF (possible)",
+                "NotPlanned": "Grid On",
             }.get(s["type"], s["type"])
-            rows.append(f"  {sh:02d}:{sm:02d} - {eh:02d}:{em:02d}  {label}")
-        body = "\n".join(rows)
+            lines.append(f"| {sh:02d}:{sm:02d} | {eh:02d}:{em:02d} | {label} |")
+        lines.append("")
+        lines.append("Legend: `##` = Grid oFF, `..` = Grid On / possible outage")
 
-    lines = [
-        f"  Address : {STREET_QUERY}, буд. {HOUSE_QUERY}",
-        f"  Group   : {group}",
-        f"  Date    : {date}",
-        f"  Status  : {status}",
-        "",
-        body,
-        "",
-        "  Legend: ## = definite outage, .. = power available / possible outage",
-    ]
-    title = f"YASNO — Kyiv outages, group {group}"
-    width = 2 + 3 * 24 + 23  # widest row
-    frame = "=" * width
-    return "\n".join([frame, " " + title, frame, *lines, frame])
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
