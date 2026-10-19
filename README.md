@@ -24,7 +24,39 @@ The website is a React SPA; all data comes from the public
 
 ```sh
 python3 -m venv .venv
-.venv/bin/pip install requests
+.venv/bin/pip install -r requirements.txt
+```
+
+## Home Assistant via MQTT
+
+`--mqtt-host` publishes the current power state of the house's outage
+group to Home Assistant through its [MQTT auto-discovery](
+https://www.home-assistant.io/integrations/mqtt/):
+
+```sh
+.venv/bin/python outages.py --mqtt-host 127.0.0.1 --mqtt-port 1883 \
+    [--mqtt-user USER --mqtt-pass PASS]
+```
+
+It publishes (all retained, QoS 1):
+
+| Entity | Type | State topic |
+|--------|------|-------------|
+| `Yasno power 45.1` | `binary_sensor`, device_class `power` | `yasnoutages/yasnoutages_power_45.1/state` (`ON`/`OFF`) |
+| `Yasno next outage 45.1` | `sensor`, duration in minutes | `yasnoutages/yasnoutages_next_outage_45.1/state` |
+
+Discovery topics: `homeassistant/binary_sensor/yasnoutages_power_45.1/config`,
+`homeassistant/sensor/yasnoutages_next_outage_45.1/config` — Home Assistant
+picks the entities up automatically. Both entities carry JSON attributes
+(address, group, schedule date/status, current slot, next outage start/end).
+
+The power state is evaluated against the current time in `Europe/Kyiv`
+against the selected day's slots (`Definite`/`Possible` ⇒ OFF).
+
+To update Home Assistant regularly, e.g. every 5 minutes:
+
+```sh
+*/5 * * * * cd /path/to/app && .venv/bin/python outages.py --mqtt-host 127.0.0.1 --mqtt-port 1883 --mqtt-user USER --mqtt-pass PASS >> outages.log 2>&1
 ```
 
 ## Run
