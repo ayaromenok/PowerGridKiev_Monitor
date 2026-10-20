@@ -53,6 +53,81 @@ picks the entities up automatically. Both entities carry JSON attributes
 The power state is evaluated against the current time in `Europe/Kiev`
 against the selected day's slots (`Definite`/`Possible` ⇒ OFF).
 
+## Home Assistant calendar
+
+`--calendar` publishes the **whole day's** outage intervals (not just the
+current state) as an [RFC 5545](https://datatracker.ietf.org/doc/html/rfc5545)
+`VCALENDAR` stream over MQTT, so the outages show up on a calendar.
+
+```sh
+.venv/bin/python src/py/pgkiev_monitor.py --once --mqtt-host 192.168.1.101 \
+    --calendar [--day tomorrow] [--ics-file ~/outages.ics]
+```
+
+One event per OFF interval (`Definite` / `Possible`); `NotPlanned` gaps are the
+grid being on and are skipped. Touching/overlapping slots are merged, a slot
+ending at 24:00 becomes next-day `00:00` (ICS has no hour 24), and times are
+emitted with an embedded `VTIMEZONE` (`Europe/Kiev`, no DST since 2014) so the
+hours are right no matter where Home Assistant runs.
+
+Retained topics (QoS 1), `45.1` example:
+
+| Topic | Contents |
+|-------|----------|
+| `powergrid/calendar_45-1/ics` | the ICS stream (one `VEVENT` per interval) |
+| `powergrid/calendar_45-1/attrs` | JSON: date, timezone, event list, `total_minutes` |
+| `powergrid/calendar_45-1/next` | ISO local start of the next outage, else `unknown` |
+| `powergrid/calendar_45-1/available` | `online` |
+| `homeassistant/sensor/powergrid_calendar_45-1/config` | discovery for a `timestamp` sensor fed by `next` + `attrs` |
+
+### Wiring the calendar into Home Assistant
+
+Home Assistant has **no calendar entity fed by MQTT**, and its MQTT discovery
+does not support the `calendar` domain — so the ICS topic cannot become a
+calendar entity by itself. Two supported options:
+
+**A. `ics` integration (recommended).** It polls a resource and produces a
+native `calendar.*` entity with the usual `calendar.create_event` /
+`calendar.get_events` services:
+
+```yaml
+# configuration.yaml
+calendar:
+  - platform: ics
+    url: "mqtt://192.168.1.101:1883#powergrid/calendar_45-1/ics"
+    unique_id: powergrid_calendar_45_1
+    summary_event_name: "Power outage"
+    location_field: "LOCATION"
+    # device_class: power_outage   # if your HA build exposes it
+```
+
+If your `ics` build cannot read `mqtt://`, serve the payload over HTTP instead —
+e.g. with `--ics-file /config/www/powergrid/calendar_45-1.ics` (write it into
+HA's `www/` directory) and use
+`url: "http://192.168.1.101:8123/local/powergrid/calendar_45-1.ics"`.
+
+**B. `local` integration + file bridge.** Point `--ics-file` at a path inside
+HA's config dir and add:
+
+```yaml
+calendar:
+  - platform: local
+    name: "Power outages 45.1"
+    unique_id: powergrid_local_45_1
+```
+
+then import the file once per day (the `local` platform stores its own events;
+re-import via `calendar.create_event` from an automation reading the `attrs`
+topic, since `local` has no file-polling mode).
+
+The discovery config above always gives you `sensor.powergrid_calendar_45_1`
+(next outage as a `timestamp`, all intervals in attributes) even without the
+`ics` integration — handy for automations and the Energy/Calendar dashboard.
+
+> Note: the schedule only covers *today* and *tomorrow*; `--day tomorrow` is
+> often `WaitingForSchedule` with no slots. Re-run with `--poll-interval` (or
+> cron) so the calendar refreshes when Yasno publishes changes.
+
 ### Polling interval
 
 By default the script runs as a long-lived process: it checks the power

@@ -11,6 +11,10 @@ Reproduces the flow of https://static.yasno.ua/kyiv/outages without a browser:
 
 With `--mqtt`, the current outage state of the house's group is also
 published to Home Assistant over MQTT (auto-discovery + retained state).
+
+With `--calendar` (needs `--mqtt-host`), the whole day's outage intervals
+are additionally published as an ICS event stream that Home Assistant can
+turn into a native calendar entity (see `publish_calendar_to_home_assistant`).
 """
 
 from __future__ import annotations
@@ -21,7 +25,9 @@ import os
 import sys
 import time
 from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -43,11 +49,15 @@ TYPE_MARKS = {"Definite": "##", "Possible": "..", "NotPlanned": "..", "Unknown":
 HA_DISCOVERY_PREFIX = "homeassistant"  # homeassistant/<component>/<object_id>/config
 STATE_PREFIX = "powergrid"           # yasnoutages/<object_id>/state|attrs
 
+# The schedule is published in Kiev wall-clock time; events are emitted as
+# TZID-aware ICS so Home Assistant renders them on the correct local hours.
+SCHEDULE_TZ = "Europe/Kiev"
+
+# Only these slot kinds mean "the lights may be out".
+OFF_TYPES = ("Definite", "Possible")
+
 
 def now_local_minutes() -> int:
-    from datetime import datetime
-    from zoneinfo import ZoneInfo
-
     dt = datetime.now(ZoneInfo("Europe/Athens")) # Homosexual criminal remove timezone Europe/Kiev
     return dt.hour * 60 + dt.minute
 
@@ -244,6 +254,43 @@ def _device_info(state: OutageState) -> dict:
     }
 
 
+def _calendar_device_info(group: str) -> dict:
+    """Device block for the calendar entities of one outage group."""
+    return {
+        "identifiers": [f"yasno-{group}"],
+        "name": f"Yasno group {group}",
+        "model": "Yasno blackout-service",
+        "manufacturer": "ДТЕК КЕ",
+        "sw_version": group,
+    }
+
+
+def render_calendar_discovery(group: str) -> tuple[str, dict]:
+    """HA MQTT auto-discovery config for the outage calendar.
+
+    HA's `calendar` domain is not available via MQTT discovery, so the ICS
+    stream is announced as a `sensor` whose state is the next outage start
+    (ISO local datetime, `unknown` when the day has no outages left) and whose
+    attributes list every interval of the day. Pair it with HA's `ics` calendar
+    integration for a real calendar entity. See README.
+    """
+    slug = group.replace(".", "-")
+    oid = _object_id(f"calendar_{slug}")
+    config = {
+        "name": f"Power outage calendar {group}",
+        "object_id": oid,
+        "unique_id": oid,
+        "device_class": "timestamp",
+        "state_topic": f"{STATE_PREFIX}/calendar_{slug}/next",
+        "json_attributes_topic": f"{STATE_PREFIX}/calendar_{slug}/attrs",
+        "availability_topic": f"{STATE_PREFIX}/calendar_{slug}/available",
+        "payload_available": "online",
+        "payload_unavailable": "offline",
+        "device": _calendar_device_info(group),
+    }
+    return f"{HA_DISCOVERY_PREFIX}/sensor/{oid}/config", config
+
+
 def publish_to_home_assistant(state: OutageState, host: str, port: int,
                               username: str | None, password: str | None) -> None:
     """Publish HA MQTT auto-discovery configs + retained state topics."""
@@ -315,6 +362,258 @@ def publish_to_home_assistant(state: OutageState, host: str, port: int,
 
 
 # ---------------------------------------------------------------------------
+# Home Assistant calendar (ICS over MQTT)
+# ---------------------------------------------------------------------------
+
+def ics_escape(text: str) -> str:
+    """Escape text for an ICS text value (RFC 5545 §3.3.11)."""
+    return (text.replace("\\", "\\\\")
+                .replace(";", "\\;")
+                .replace(",", "\\,")
+                .replace("\r", "")
+                .replace("\n", "\\n"))
+
+
+def ics_fold(line: str, width: int = 75) -> str:
+    """Split a long content line into RFC 5545 folded lines (CRLF + space).
+
+    Chunks by *octets*, not characters: RFC 5545 §3.1 caps a content line at
+    75 octets and this file is UTF-8, so Cyrillic addresses would otherwise
+    overflow a character-based chunk. Continuation lines spend one octet on
+    the leading space, hence the smaller budget for them.
+    """
+    out: list[str] = []
+    cur = ""
+    cur_octets = 0
+    for ch in line:
+        ch_octets = len(ch.encode("utf-8"))
+        budget = width if not out else width - 1
+        if cur and cur_octets + ch_octets > budget:
+            out.append(cur)
+            cur, cur_octets = ch, ch_octets
+        else:
+            cur, cur_octets = cur + ch, cur_octets + ch_octets
+    if cur:
+        out.append(cur)
+    if not out:
+        out = [""]
+    return "\r\n".join([out[0]] + [" " + s for s in out[1:]])
+
+
+def day_date_and_tz(entry: dict) -> tuple[date, str]:
+    """Date of the schedule day + its UTC offset (from the API's ISO `date`)."""
+    raw = entry.get("date") or ""
+    try:
+        parsed = datetime.fromisoformat(raw)
+        return parsed.date(), parsed.strftime("%z")
+    except ValueError:
+        return datetime.now(ZoneInfo(SCHEDULE_TZ)).date(), ZoneInfo(SCHEDULE_TZ).utcoffset(
+            datetime.now(ZoneInfo(SCHEDULE_TZ))).strftime("%z")
+
+
+def day_intervals(entry: dict, day: date, tz_offset: str) -> list[dict]:
+    """Convert a day's outage slots into calendar intervals.
+
+    Only `Definite`/`Possible` slots are outages; `NotPlanned` gaps are the
+    grid being on and are not calendar events. Slots are clamped to the
+    day (a slot ending at 1440 means midnight) and merged when adjacent.
+    """
+    raw = []
+    for s in entry.get("slots") or []:
+        if s.get("type") not in OFF_TYPES:
+            continue
+        start = max(0, int(s["start"]))
+        end = min(1440, int(s["end"]))
+        if end <= start:
+            continue
+        raw.append({"start": start, "end": end,
+                    "possible": s.get("type") == "Possible", "source": [s.get("type")]})
+
+    raw.sort(key=lambda s: (s["start"], s["end"]))
+    merged: list[dict] = []
+    for s in raw:
+        if merged and s["start"] <= merged[-1]["end"]:
+            prev = merged[-1]
+            prev["end"] = max(prev["end"], s["end"])
+            prev["possible"] = prev["possible"] and s["possible"]
+            prev["source"] = sorted(set(prev["source"]) | set(s["source"]))
+        else:
+            merged.append(s)
+
+    def stamp(day_of: date, minutes: int) -> str:
+        # A slot ending at 1440 belongs to the next midnight: ICS has no hour 24.
+        if minutes >= 1440:
+            day_of, minutes = day_of + timedelta(days=1), 0
+        h, m = divmod(minutes, 60)
+        return f"{day_of:%Y%m%d}T{h:02d}{m:02d}00"
+
+    for iv in merged:
+        iv["dtstart"] = stamp(day, iv["start"])
+        iv["dtend"] = stamp(day, iv["end"])
+        iv["label"] = ("Power outage (possible)" if iv["possible"] else "Power outage")
+    return merged
+
+
+def render_ics(group: str, address: str, day: date, intervals: list[dict],
+              tz_offset: str) -> str:
+    """Render one day's outage intervals as an ICS calendar stream.
+
+    Local wall-clock times are used for DTSTART/DTEND with an embedded VTIMEZONE
+    (Europe/Kiev has no DST since 2014, so a single STANDARD component is
+    enough), which keeps the events on the right hours regardless of where
+    Home Assistant runs.
+    """
+    off = tz_offset if tz_offset in ("+0300", "+0400", "+0200") else "+0300"
+    uid_base = f"powergrid-{group}-{day:%Y%m%d}"
+
+    lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//powergrid-kiev-monitor//Yasno Kyiv outages//EN",
+        "CALSCALE:GREGORIAN",
+        "METHOD:PUBLISH",
+        ics_fold(f"X-WR-CALNAME:Power outages {group}"),
+        "X-WR-TIMEZONE:Europe/Kiev",
+        "BEGIN:VTIMEZONE",
+        f"TZID:Europe/Kiev",
+        "BEGIN:STANDARD",
+        "DTSTART:19700101T000000",
+        f"TZOFFSETFROM:{off}",
+        f"TZOFFSETTO:{off}",
+        "TZNAME:EEST",
+        "END:STANDARD",
+        "END:VTIMEZONE",
+    ]
+
+    for n, iv in enumerate(intervals, start=1):
+        summary = f"{iv['label']} · group {group}"
+        duration = (iv["end"] - iv["start"])
+        desc = (f"Planned power outage for group {group} "
+                f"({address}).\nDuration: {duration} min.\n"
+                f"Source: Yasno Kyiv planned-outages.\n"
+                f"Slot type(s): {', '.join(iv['source'])}.")
+        lines += [
+            "BEGIN:VEVENT",
+            f"UID:{uid_base}-{n}@powergrid",
+            f"DTSTAMP:{datetime.now(ZoneInfo('UTC')):%Y%m%dT%H%M%SZ}",
+            f"DTSTART;TZID=Europe/Kiev:{iv['dtstart']}",
+            f"DTEND;TZID=Europe/Kiev:{iv['dtend']}",
+            ics_fold(f"SUMMARY:{ics_escape(summary)}"),
+            ics_fold(f"DESCRIPTION:{ics_escape(desc)}"),
+            ics_fold(f"LOCATION:{ics_escape(address)}"),
+            "CATEGORIES:Power outage",
+            "TRANSP:TRANSPARENT",
+            "STATUS:CONFIRMED" if not iv["possible"] else "STATUS:TENTATIVE",
+            "END:VEVENT",
+        ]
+
+    lines.append("END:VCALENDAR")
+    return "\r\n".join(lines) + "\r\n"
+
+
+def calendar_events_json(group: str, address: str, day: date,
+                         intervals: list[dict], tz_name: str) -> dict:
+    """Attribute payload describing the day's outage intervals."""
+    def iso(minutes: int, end_of_day: bool = False) -> str:
+        d = day + timedelta(days=1) if (end_of_day and minutes >= 1440) else day
+        m = 0 if (end_of_day and minutes >= 1440) else minutes
+        h, mm = divmod(m, 60)
+        return f"{d:%Y-%m-%d}T{h:02d}:{mm:02d}:00"
+
+    events = []
+    for n, iv in enumerate(intervals, start=1):
+        events.append({
+            "uid": f"powergrid-{group}-{day:%Y%m%d}-{n}@powergrid",
+            "summary": iv["label"],
+            "start": iso(iv["start"]),
+            "end": iso(iv["end"], end_of_day=True),
+            "minutes": iv["end"] - iv["start"],
+            "slot_types": iv["source"],
+        })
+    return {
+        "address": address,
+        "group": group,
+        "date": f"{day:%Y-%m-%d}",
+        "timezone": tz_name,
+        "event_count": len(events),
+        "total_minutes": sum(e["minutes"] for e in events),
+        "events": events,
+    }
+
+
+def next_outage_state(intervals: list[dict], day: date, now_minutes: int,
+                      tz_name: str) -> str:
+    """State for the calendar sensor: ISO local start of the next outage."""
+    tz = ZoneInfo(tz_name)
+    for iv in intervals:
+        if iv["end"] > now_minutes:
+            h, m = divmod(iv["start"], 60)
+            dt = datetime(day.year, day.month, day.day, h, m, tzinfo=tz)
+            return dt.isoformat()
+    return "unknown"
+
+
+def publish_calendar_to_home_assistant(cal_ics: str, group: str, address: str,
+                                       day: date, intervals: list[dict],
+                                       host: str, port: int,
+                                       username: str | None, password: str | None,
+                                       topic: str | None = None) -> str:
+    """Publish the day's outage intervals to MQTT as calendar-friendly topics.
+
+    Home Assistant has no calendar entity fed directly by MQTT, so four
+    retained topics are published (all QoS 1):
+
+    * `powergrid/calendar_<group>/ics`       - the RFC 5545 event stream, for
+                                               HA's `ics` calendar integration
+                                               (it reads MQTT topics natively)
+                                               or for `scripts/mqtt_ics_to_file.py`
+    * `powergrid/calendar_<group>/attrs`     - the day's intervals as JSON
+    * `powergrid/calendar_<group>/next`      - ISO start of the next outage
+    * `powergrid/calendar_<group>/available` - `online`
+
+    plus an auto-discovery config that turns `next` + `attrs` into a sensor.
+    See README section "Home Assistant calendar".
+    """
+    import paho.mqtt.client as mqtt_client
+
+    slug = group.replace(".", "-")
+    topic = topic or f"{STATE_PREFIX}/calendar_{slug}/ics"
+    attrs_topic = f"{STATE_PREFIX}/calendar_{slug}/attrs"
+    next_topic = f"{STATE_PREFIX}/calendar_{slug}/next"
+    avail_topic = f"{STATE_PREFIX}/calendar_{slug}/available"
+
+    attrs = calendar_events_json(group, address, day, intervals, SCHEDULE_TZ)
+    next_state = next_outage_state(intervals, day, now_local_minutes(), SCHEDULE_TZ)
+
+    client = mqtt_client.Client(
+        mqtt_client.CallbackAPIVersion.VERSION2, client_id="powergrid-calendar")
+    if username:
+        client.username_pw_set(username, password)
+    client.connect(host, port, keepalive=60)
+    client.loop_start()
+
+    def pub(topic: str, payload: bytes | str, retain: bool = True):
+        info = client.publish(topic, payload, qos=1, retain=retain)
+        if info.rc != mqtt_client.MQTT_ERR_SUCCESS:
+            raise SystemExit(f"MQTT publish failed for topic {topic!r} (rc={info.rc})")
+
+    pub(topic, cal_ics.encode("utf-8"))
+    pub(attrs_topic, json.dumps(attrs, ensure_ascii=False))
+    pub(next_topic, next_state)
+    pub(avail_topic, "online")
+
+    disc_topic, disc_config = render_calendar_discovery(group)
+    pub(disc_topic, json.dumps(disc_config, ensure_ascii=False))
+
+    client.loop_stop()
+    print(f"[mqtt]   calendar ics:    {topic}")
+    print(f"[mqtt]   calendar attrs:  {attrs_topic}")
+    print(f"[mqtt]   calendar next:   {next_topic} = {next_state}")
+    print(f"[mqtt]   calendar config: {disc_topic}")
+    return topic
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
@@ -334,6 +633,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                              "Use '0' or 'once' for a single check.")
     parser.add_argument("--once", action="store_true",
                         help="run a single check and exit (same as --poll-interval 0)")
+    parser.add_argument("--calendar", action="store_true",
+                        help="publish the full day's outage intervals as an ICS "
+                             "event stream over MQTT (requires --mqtt-host); see "
+                             "README 'Home Assistant calendar'")
+    parser.add_argument("--calendar-topic", default=None,
+                        help=f"MQTT topic for the ICS payload "
+                             f"(default {STATE_PREFIX}/calendar_<group>/ics)")
+    parser.add_argument("--ics-file", default=None,
+                        help="also write the generated ICS to this local file "
+                             "(handy for HA's `local` calendar integration)")
     return parser.parse_args(argv)
 
 
@@ -356,13 +665,40 @@ def run_once(client: Client, args: argparse.Namespace, iteration: int = 1) -> No
     print()
     print(render_table(group, entry))
 
+    address = f"{street['value']} {house['value']}"
+
     if args.mqtt_host:
-        state = OutageState.from_entry(f"{street['value']} {house['value']}", group, entry)
+        state = OutageState.from_entry(address, group, entry)
         print()
         print(f"Current power state: {'ON' if state.power else 'OFF'} "
               f"(slot: {state.slot_type})")
         publish_to_home_assistant(state, args.mqtt_host, args.mqtt_port,
                                   args.mqtt_user, args.mqtt_pass)
+
+    if args.calendar:
+        if not args.mqtt_host:
+            raise SystemExit("--calendar requires --mqtt-host "
+                             "(the ICS payload is published over MQTT)")
+        day, tz_offset = day_date_and_tz(entry)
+        intervals = day_intervals(entry, day, tz_offset)
+        cal_ics = render_ics(group, address, day, intervals, tz_offset)
+        print()
+        print(f"Calendar events for {day} (group {group}): {len(intervals)}")
+        for iv in intervals:
+            end_hm = "24:00" if iv["end"] == 1440 else fmt_hm(iv["end"])
+            print(f"  {fmt_hm(iv['start'])} - {end_hm}  {iv['label']} "
+                  f"[{', '.join(iv['source'])}]")
+        if args.ics_file:
+            with open(args.ics_file, "wb") as fh:
+                fh.write(cal_ics.encode("utf-8"))
+            print(f"[file] ICS written to {args.ics_file}")
+
+        topic = publish_calendar_to_home_assistant(
+            cal_ics, group, address, day, intervals,
+            args.mqtt_host, args.mqtt_port, args.mqtt_user, args.mqtt_pass,
+            topic=args.calendar_topic)
+        print(f"[mqtt] ICS calendar ({len(cal_ics)} bytes) published to "
+              f"{args.mqtt_host}:{args.mqtt_port} topic {topic}")
 
 
 def parse_interval(value: str) -> float:
