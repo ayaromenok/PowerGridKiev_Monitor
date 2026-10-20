@@ -173,13 +173,40 @@ def find_group(client: Client, region: dict, street: dict, house: dict) -> str:
     return f"{info['group']}.{info.get('subgroup', 0)}"
 
 
-def fetch_schedule(client: Client, region: dict, group: str, day: str) -> dict:
+def fetch_schedule_all(client: Client, region: dict, group: str) -> dict:
+    """Fetch the raw per-group schedule: {'today': {...}, 'tomorrow': {...}}."""
     dso_id = region["dsos"][0]["id"]
     data = client.get(f"/regions/{region['id']}/dsos/{dso_id}/planned-outages")
     entry = data.get(group)
     if entry is None:
         raise SystemExit(f"Group {group} not present in schedule")
-    return entry.get(day) or {}
+    return entry
+
+
+def fetch_schedule(client: Client, region: dict, group: str, day: str) -> dict:
+    return fetch_schedule_all(client, region, group).get(day) or {}
+
+
+def available_days(schedule: dict, requested: str | None) -> list[str]:
+    """Which schedule days to use.
+
+    Default (requested=None): 'today' always, plus 'tomorrow' when the API
+    actually published a schedule for it (status != WaitingForSchedule and
+    non-empty slots). A day that exists but has no slots yet is skipped, not
+    reported as an empty 24h — Yasno fills tomorrow in during the day.
+    """
+    def has_schedule(day: str) -> bool:
+        entry = schedule.get(day) or {}
+        return bool(entry.get("slots")) and entry.get("status") != "WaitingForSchedule"
+
+    if requested == "today":
+        return ["today"]
+    if requested == "tomorrow":
+        return ["tomorrow"] if has_schedule("tomorrow") else []
+    days = ["today"]
+    if has_schedule("tomorrow"):
+        days.append("tomorrow")
+    return days
 
 
 def render_table(group: str, entry: dict) -> str:
@@ -411,12 +438,16 @@ def day_date_and_tz(entry: dict) -> tuple[date, str]:
             datetime.now(ZoneInfo(SCHEDULE_TZ))).strftime("%z")
 
 
-def day_intervals(entry: dict, day: date, tz_offset: str) -> list[dict]:
+def day_intervals(entry: dict, day: date, tz_offset: str,
+                  day_key: str = "today") -> list[dict]:
     """Convert a day's outage slots into calendar intervals.
 
     Only `Definite`/`Possible` slots are outages; `NotPlanned` gaps are the
     grid being on and are not calendar events. Slots are clamped to the
     day (a slot ending at 1440 means midnight) and merged when adjacent.
+
+    `day_key` records which day of the schedule the interval came from so
+    multi-day output stays readable.
     """
     raw = []
     for s in entry.get("slots") or []:
@@ -450,21 +481,23 @@ def day_intervals(entry: dict, day: date, tz_offset: str) -> list[dict]:
     for iv in merged:
         iv["dtstart"] = stamp(day, iv["start"])
         iv["dtend"] = stamp(day, iv["end"])
+        iv["day_key"] = day_key
         iv["label"] = ("Power outage (possible)" if iv["possible"] else "Power outage")
     return merged
 
 
-def render_ics(group: str, address: str, day: date, intervals: list[dict],
-              tz_offset: str) -> str:
-    """Render one day's outage intervals as an ICS calendar stream.
+def render_ics(group: str, address: str, intervals: list[dict],
+               today_entry: dict) -> str:
+    """Render outage intervals as an ICS calendar stream.
 
-    Local wall-clock times are used for DTSTART/DTEND with an embedded VTIMEZONE
-    (Europe/Kiev has no DST since 2014, so a single STANDARD component is
-    enough), which keeps the events on the right hours regardless of where
-    Home Assistant runs.
+    Intervals may span several days (today + tomorrow); each carries its own
+    `dtstart`/`dtend` stamped from its own day. Local wall-clock times are used
+    with an embedded VTIMEZONE (Europe/Kiev has no DST since 2014, so a single
+    STANDARD component is enough), which keeps the events on the right hours
+    regardless of where Home Assistant runs.
     """
+    _, tz_offset = day_date_and_tz(today_entry)
     off = tz_offset if tz_offset in ("+0300", "+0400", "+0200") else "+0300"
-    uid_base = f"powergrid-{group}-{day:%Y%m%d}"
 
     lines = [
         "BEGIN:VCALENDAR",
@@ -494,7 +527,7 @@ def render_ics(group: str, address: str, day: date, intervals: list[dict],
                 f"Slot type(s): {', '.join(iv['source'])}.")
         lines += [
             "BEGIN:VEVENT",
-            f"UID:{uid_base}-{n}@powergrid",
+            f"UID:powergrid-{group}-{iv['dtstart']}-{n}@powergrid",
             f"DTSTAMP:{datetime.now(ZoneInfo('UTC')):%Y%m%dT%H%M%SZ}",
             f"DTSTART;TZID=Europe/Kiev:{iv['dtstart']}",
             f"DTEND;TZID=Europe/Kiev:{iv['dtend']}",
@@ -511,29 +544,25 @@ def render_ics(group: str, address: str, day: date, intervals: list[dict],
     return "\r\n".join(lines) + "\r\n"
 
 
-def calendar_events_json(group: str, address: str, day: date,
+def calendar_events_json(group: str, address: str,
                          intervals: list[dict], tz_name: str) -> dict:
-    """Attribute payload describing the day's outage intervals."""
-    def iso(minutes: int, end_of_day: bool = False) -> str:
-        d = day + timedelta(days=1) if (end_of_day and minutes >= 1440) else day
-        m = 0 if (end_of_day and minutes >= 1440) else minutes
-        h, mm = divmod(m, 60)
-        return f"{d:%Y-%m-%d}T{h:02d}:{mm:02d}:00"
-
+    """Attribute payload describing the published outage intervals."""
     events = []
     for n, iv in enumerate(intervals, start=1):
         events.append({
-            "uid": f"powergrid-{group}-{day:%Y%m%d}-{n}@powergrid",
+            "uid": f"powergrid-{group}-{iv['dtstart']}-{n}@powergrid",
             "summary": iv["label"],
-            "start": iso(iv["start"]),
-            "end": iso(iv["end"], end_of_day=True),
+            "day": iv["day_key"],
+            "start": iso_local(iv["dtstart"]),
+            "end": iso_local(iv["dtend"]),
             "minutes": iv["end"] - iv["start"],
             "slot_types": iv["source"],
         })
     return {
         "address": address,
         "group": group,
-        "date": f"{day:%Y-%m-%d}",
+        "days": sorted({iv["day_key"] for iv in intervals}),
+        "date": events[0]["start"][:10] if events else None,
         "timezone": tz_name,
         "event_count": len(events),
         "total_minutes": sum(e["minutes"] for e in events),
@@ -541,20 +570,26 @@ def calendar_events_json(group: str, address: str, day: date,
     }
 
 
-def next_outage_state(intervals: list[dict], day: date, now_minutes: int,
+def iso_local(stamp: str) -> str:
+    """'20261021T000000' -> '2026-10-21T00:00:00'."""
+    return f"{stamp[0:4]}-{stamp[4:6]}-{stamp[6:8]}T{stamp[9:11]}:{stamp[11:13]}:00"
+
+
+def next_outage_state(intervals: list[dict], now: datetime,
                       tz_name: str) -> str:
     """State for the calendar sensor: ISO local start of the next outage."""
-    tz = ZoneInfo(tz_name)
     for iv in intervals:
-        if iv["end"] > now_minutes:
-            h, m = divmod(iv["start"], 60)
-            dt = datetime(day.year, day.month, day.day, h, m, tzinfo=tz)
-            return dt.isoformat()
+        start = datetime.strptime(iv["dtstart"], "%Y%m%dT%H%M%S").replace(
+            tzinfo=ZoneInfo(tz_name))
+        end = datetime.strptime(iv["dtend"], "%Y%m%dT%H%M%S").replace(
+            tzinfo=ZoneInfo(tz_name))
+        if end > now:
+            return start.isoformat()
     return "unknown"
 
 
 def publish_calendar_to_home_assistant(cal_ics: str, group: str, address: str,
-                                       day: date, intervals: list[dict],
+                                       intervals: list[dict],
                                        host: str, port: int,
                                        username: str | None, password: str | None,
                                        topic: str | None = None) -> str:
@@ -582,8 +617,9 @@ def publish_calendar_to_home_assistant(cal_ics: str, group: str, address: str,
     next_topic = f"{STATE_PREFIX}/calendar_{slug}/next"
     avail_topic = f"{STATE_PREFIX}/calendar_{slug}/available"
 
-    attrs = calendar_events_json(group, address, day, intervals, SCHEDULE_TZ)
-    next_state = next_outage_state(intervals, day, now_local_minutes(), SCHEDULE_TZ)
+    attrs = calendar_events_json(group, address, intervals, SCHEDULE_TZ)
+    now = datetime.now(ZoneInfo(SCHEDULE_TZ))
+    next_state = next_outage_state(intervals, now, SCHEDULE_TZ)
 
     client = mqtt_client.Client(
         mqtt_client.CallbackAPIVersion.VERSION2, client_id="powergrid-calendar")
@@ -625,8 +661,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--mqtt-pass", help="MQTT password")
     parser.add_argument("--street", default=STREET_QUERY, help=f"street query (default {STREET_QUERY!r})")
     parser.add_argument("--house", default=HOUSE_QUERY, help=f"house query (default {HOUSE_QUERY!r})")
-    parser.add_argument("--day", choices=["today", "tomorrow"], default="today",
-                        help="which day of the schedule to show (default today)")
+    parser.add_argument("--day", choices=["today", "tomorrow", "both"], default=None,
+                        help="which day(s) of the schedule to show. Default: today, "
+                             "plus tomorrow whenever the API has a schedule for it; "
+                             "'both' asks for both explicitly")
     parser.add_argument("--poll-interval", default=None,
                         help="interval between status checks (e.g. '3', '3h', '90m'; "
                              f"default {DEFAULT_POLL_INTERVAL_HOURS:g} hours). "
@@ -661,40 +699,61 @@ def run_once(client: Client, args: argparse.Namespace, iteration: int = 1) -> No
     group = find_group(client, region, street, house)
     print(f"  -> outage group {group}")
 
-    entry = fetch_schedule(client, region, group, day=args.day)
-    print()
-    print(render_table(group, entry))
+    schedule = fetch_schedule_all(client, region, group)
+    days = available_days(schedule, args.day)
+    if not days:
+        print("\nNo schedule published yet for tomorrow "
+              "(status=WaitingForSchedule); showing nothing.")
+        return
+    if args.day is None:
+        print(f"  -> days available: {', '.join(days)}")
 
     address = f"{street['value']} {house['value']}"
 
+    # The current power state is about "now", so it always comes from today.
+    today_entry = schedule.get("today") or {}
     if args.mqtt_host:
-        state = OutageState.from_entry(address, group, entry)
+        state = OutageState.from_entry(address, group, today_entry)
         print()
         print(f"Current power state: {'ON' if state.power else 'OFF'} "
               f"(slot: {state.slot_type})")
         publish_to_home_assistant(state, args.mqtt_host, args.mqtt_port,
                                   args.mqtt_user, args.mqtt_pass)
 
-    if args.calendar:
-        if not args.mqtt_host:
-            raise SystemExit("--calendar requires --mqtt-host "
-                             "(the ICS payload is published over MQTT)")
+    if args.calendar and not args.mqtt_host:
+        raise SystemExit("--calendar requires --mqtt-host "
+                         "(the ICS payload is published over MQTT)")
+
+    # Calendar events: one ICS stream covering all selected days, so HA shows
+    # today and tomorrow together instead of clobbering one with the other.
+    all_intervals: list[dict] = []
+    cal_ics = ""
+    for day_key in days:
+        entry = schedule.get(day_key) or {}
         day, tz_offset = day_date_and_tz(entry)
         intervals = day_intervals(entry, day, tz_offset)
-        cal_ics = render_ics(group, address, day, intervals, tz_offset)
+        all_intervals += intervals
         print()
-        print(f"Calendar events for {day} (group {group}): {len(intervals)}")
+        print(f"Calendar events for {day} ({day_key}, group {group}): "
+              f"{len(intervals)}")
         for iv in intervals:
             end_hm = "24:00" if iv["end"] == 1440 else fmt_hm(iv["end"])
             print(f"  {fmt_hm(iv['start'])} - {end_hm}  {iv['label']} "
                   f"[{', '.join(iv['source'])}]")
+        if not args.calendar:
+            print()
+            print(render_table(group, entry))
+
+    if args.calendar:
+        cal_ics = render_ics(group, address, all_intervals,
+                             schedule.get("today") or {})
         if args.ics_file:
             with open(args.ics_file, "wb") as fh:
                 fh.write(cal_ics.encode("utf-8"))
             print(f"[file] ICS written to {args.ics_file}")
 
         topic = publish_calendar_to_home_assistant(
-            cal_ics, group, address, day, intervals,
+            cal_ics, group, address, all_intervals,
             args.mqtt_host, args.mqtt_port, args.mqtt_user, args.mqtt_pass,
             topic=args.calendar_topic)
         print(f"[mqtt] ICS calendar ({len(cal_ics)} bytes) published to "
