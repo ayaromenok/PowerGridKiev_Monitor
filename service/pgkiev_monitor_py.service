@@ -1,0 +1,7 @@
+[Unit]
+Description=PowerGrid Kiev Monitor service
+
+[Service]
+ExecStart=python /home/pi/projects/PowerGridKiev_Monitor/src/py/pgkiev_monitor.py  --mqtt-host 192.168.1.101 --day today --poll-interval 1h
+[Install]
+WantedBy=multi-user.target
