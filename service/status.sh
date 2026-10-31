@@ -1,2 +1,2 @@
 #!/bin/sh
-sudo systemctl status pgkiev_monitor_py
+sudo systemctl status pgkiev_monitor_py --no-pager
